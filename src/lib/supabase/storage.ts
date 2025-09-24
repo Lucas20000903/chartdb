@@ -1,4 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
+import deepEqual from 'fast-deep-equal';
 
 import type { StorageContext } from '@/context/storage-context/storage-context';
 import type { Diagram } from '@/lib/domain/diagram';
@@ -64,6 +65,11 @@ const mapAreas = (rows: DiagramContentRow[]): Area[] =>
 
 const mapCustomTypes = (rows: DiagramContentRow[]): DBCustomType[] =>
     rows.map((row) => row.payload as DBCustomType);
+
+const hasPayloadChanged = <Payload>(
+    previous: Payload | undefined | null,
+    next: Payload
+) => !deepEqual(previous, next);
 
 const handle = async <T>(
     promise: Promise<{ data: T; error: { message: string } | null }>,
@@ -185,6 +191,10 @@ export const createSupabaseStorage = (
             ...config,
         };
 
+        if (!hasPayloadChanged(existing, merged)) {
+            return;
+        }
+
         await handle(
             client.from(TABLE_USER_CONFIGS).upsert(
                 [
@@ -214,6 +224,11 @@ export const createSupabaseStorage = (
         diagramId,
         filter
     ) => {
+        const existing = await getDiagramFilter(diagramId);
+        if (!hasPayloadChanged(existing, filter)) {
+            return;
+        }
+
         await handle(
             client.from(TABLE_DIAGRAM_FILTERS).upsert(
                 [
@@ -474,19 +489,40 @@ export const createSupabaseStorage = (
         id,
         attributes,
     }) => {
+        const result = await client
+            .from(TABLE_DIAGRAMS)
+            .select('*')
+            .eq('user_id', userId)
+            .eq('id', id)
+            .maybeSingle();
+        const row = await handle(result, 'load diagram for update');
+
+        if (!row) {
+            return;
+        }
+
         const payload: Partial<DiagramRow> = {};
 
-        if (attributes.name !== undefined) {
+        if (attributes.name !== undefined && attributes.name !== row.name) {
             payload.name = attributes.name;
         }
-        if (attributes.databaseType !== undefined) {
+        if (
+            attributes.databaseType !== undefined &&
+            attributes.databaseType !== row.database_type
+        ) {
             payload.database_type = attributes.databaseType;
         }
         if ('databaseEdition' in attributes) {
-            payload.database_edition = attributes.databaseEdition ?? null;
+            const nextEdition = attributes.databaseEdition ?? null;
+            if (nextEdition !== row.database_edition) {
+                payload.database_edition = nextEdition;
+            }
         }
         if (attributes.updatedAt) {
-            payload.updated_at = attributes.updatedAt.toISOString();
+            const nextUpdatedAt = attributes.updatedAt.toISOString();
+            if (nextUpdatedAt !== row.updated_at) {
+                payload.updated_at = nextUpdatedAt;
+            }
         }
 
         if (Object.keys(payload).length > 0) {
@@ -500,13 +536,12 @@ export const createSupabaseStorage = (
             );
         }
 
-        if (attributes.id && attributes.id !== id) {
-            const newId = attributes.id;
-
+        const nextId = attributes.id;
+        if (nextId && nextId !== id) {
             await handle(
                 client
                     .from(TABLE_DIAGRAMS)
-                    .update({ id: newId })
+                    .update({ id: nextId })
                     .eq('user_id', userId)
                     .eq('id', id),
                 'update diagram id'
@@ -524,7 +559,7 @@ export const createSupabaseStorage = (
                     handle(
                         client
                             .from(table)
-                            .update({ diagram_id: newId })
+                            .update({ diagram_id: nextId })
                             .eq('user_id', userId)
                             .eq('diagram_id', id),
                         `update ${table} diagram ids`
@@ -577,10 +612,15 @@ export const createSupabaseStorage = (
 
         if (!row) return;
 
+        const previous = row.payload as DBTable;
         const updated = {
-            ...(row.payload as DBTable),
+            ...previous,
             ...attributes,
         } as DBTable;
+
+        if (!hasPayloadChanged(previous, updated)) {
+            return;
+        }
 
         await updateContent(TABLE_DB_TABLES, id, updated);
     };
@@ -589,6 +629,16 @@ export const createSupabaseStorage = (
         diagramId,
         table,
     }) => {
+        const row = await getContentRow<DBTable>(
+            TABLE_DB_TABLES,
+            diagramId,
+            table.id
+        );
+
+        if (!hasPayloadChanged(row?.payload as DBTable | undefined, table)) {
+            return;
+        }
+
         await upsertContent(TABLE_DB_TABLES, diagramId, table.id, table);
     };
 
@@ -643,10 +693,15 @@ export const createSupabaseStorage = (
 
         if (!row) return;
 
+        const previous = row.payload as DBRelationship;
         const updated = {
-            ...(row.payload as DBRelationship),
+            ...previous,
             ...attributes,
         } as DBRelationship;
+
+        if (!hasPayloadChanged(previous, updated)) {
+            return;
+        }
 
         await updateContent(TABLE_DB_RELATIONSHIPS, id, updated);
     };
@@ -706,10 +761,15 @@ export const createSupabaseStorage = (
 
         if (!row) return;
 
+        const previous = row.payload as DBDependency;
         const updated = {
-            ...(row.payload as DBDependency),
+            ...previous,
             ...attributes,
         } as DBDependency;
+
+        if (!hasPayloadChanged(previous, updated)) {
+            return;
+        }
 
         await updateContent(TABLE_DB_DEPENDENCIES, id, updated);
     };
@@ -753,10 +813,15 @@ export const createSupabaseStorage = (
         const row = await handle(result, 'load area for update');
         if (!row) return;
 
+        const previous = row.payload as Area;
         const updated = {
-            ...(row.payload as Area),
+            ...previous,
             ...attributes,
         } as Area;
+
+        if (!hasPayloadChanged(previous, updated)) {
+            return;
+        }
 
         await updateContent(TABLE_AREAS, id, updated);
     };
@@ -811,10 +876,15 @@ export const createSupabaseStorage = (
         const row = await handle(result, 'load custom type for update');
         if (!row) return;
 
+        const previous = row.payload as DBCustomType;
         const updated = {
-            ...(row.payload as DBCustomType),
+            ...previous,
             ...attributes,
         } as DBCustomType;
+
+        if (!hasPayloadChanged(previous, updated)) {
+            return;
+        }
 
         await updateContent(TABLE_DB_CUSTOM_TYPES, id, updated);
     };

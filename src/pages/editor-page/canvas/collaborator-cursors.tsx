@@ -61,25 +61,27 @@ export const CollaboratorCursors: React.FC<CollaboratorCursorsProps> = ({
                 return (
                     <div
                         key={cursor.sessionId}
-                        className="pointer-events-none absolute"
+                        className="absolute pointer-events-none"
                         style={{
                             left: `${cursor.x * 100}%`,
                             top: `${cursor.y * 100}%`,
+                            // left: `${cursor.x}px`,
+                            // top: `${cursor.y}px`,
                         }}
                     >
-                        <div className="flex -translate-x-1/2 -translate-y-1/2 flex-col items-start gap-1">
+                        <div className="flex flex-col items-start gap-1 -translate-x-1/2 -translate-y-1/2">
                             <div
-                                className="flex items-center gap-2 rounded-full border bg-white/80 px-3 py-1 text-xs font-medium text-slate-900 shadow-md backdrop-blur-sm"
+                                className="flex items-center gap-2 px-3 py-1 text-xs font-medium border rounded-full shadow-md bg-white/80 text-slate-900 backdrop-blur-sm"
                                 style={{ borderColor: color }}
                             >
                                 <span
-                                    className="inline-flex size-2 rounded-full"
+                                    className="inline-flex rounded-full size-2"
                                     style={{ backgroundColor: color }}
                                 />
                                 <span>{name}</span>
                             </div>
                             <div
-                                className="size-2 rotate-45 rounded-sm"
+                                className="rotate-45 rounded-sm size-2"
                                 style={{ backgroundColor: color }}
                             />
                         </div>
