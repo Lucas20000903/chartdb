@@ -1,4 +1,10 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, {
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from 'react';
 import type { DBTable } from '@/lib/domain/db-table';
 import { deepCopy, generateId } from '@/lib/utils';
 import { defaultTableColor, defaultAreaColor, viewColor } from '@/lib/colors';
@@ -31,6 +37,21 @@ import {
     DBCustomTypeKind,
     type DBCustomType,
 } from '@/lib/domain/db-custom-type';
+import { useAuth } from '@/hooks/use-auth';
+import { supabaseClient } from '@/lib/supabase/client';
+import type { RealtimeChannel } from '@supabase/supabase-js';
+import { nanoid } from 'nanoid';
+import {
+    diagramRealtimeContext,
+    type DiagramPresenceParticipant,
+    type RemoteCursorState,
+} from '@/context/diagram-realtime-context/diagram-realtime-context';
+import { SUPABASE_ENABLED } from '@/lib/env';
+
+const PRESENCE_KEEP_ALIVE_MS = 30_000;
+const CURSOR_STALE_THRESHOLD_MS = 10_000;
+const DIRTY_EVENT = 'diagram:dirty';
+const CURSOR_EVENT = 'cursor:update';
 
 export interface ChartDBProviderProps {
     diagram?: Diagram;
@@ -41,10 +62,27 @@ export const ChartDBProvider: React.FC<
     React.PropsWithChildren<ChartDBProviderProps>
 > = ({ children, diagram, readonly: readonlyProp }) => {
     const { hasDiff } = useDiff();
+    const { supabaseEnabled, user } = useAuth();
     const storageDB = useStorage();
     const events = useEventEmitter<ChartDBEvent>();
     const { addUndoAction, resetRedoStack, resetUndoStack } =
         useRedoUndoStack();
+    const sessionId = useMemo(() => nanoid(), []);
+    const [realtimeChannel, setRealtimeChannel] =
+        useState<RealtimeChannel | null>(null);
+    const [channelReady, setChannelReady] = useState(false);
+    const [presenceParticipants, setPresenceParticipants] = useState<
+        DiagramPresenceParticipant[]
+    >([]);
+    const [remoteCursorsMap, setRemoteCursorsMap] = useState<
+        Record<string, RemoteCursorState>
+    >({});
+    const suppressBroadcastRef = useRef(false);
+    const initialLoadRef = useRef(true);
+    const cursorGcIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
+        null
+    );
+    const loadDiagramRef = useRef<ChartDBContext['loadDiagram'] | null>(null);
 
     const [diagramId, setDiagramId] = useState('');
     const [diagramName, setDiagramName] = useState('');
@@ -162,6 +200,224 @@ export const ChartDBProvider: React.FC<
             diagramUpdatedAt,
         ]
     );
+
+    useEffect(() => {
+        initialLoadRef.current = true;
+    }, [diagramId]);
+
+    useEffect(() => {
+        if (!supabaseEnabled || !SUPABASE_ENABLED || !supabaseClient) {
+            if (cursorGcIntervalRef.current) {
+                clearInterval(cursorGcIntervalRef.current);
+                cursorGcIntervalRef.current = null;
+            }
+            setChannelReady(false);
+            setRealtimeChannel(null);
+            setPresenceParticipants([]);
+            setRemoteCursorsMap({});
+            return;
+        }
+
+        if (!diagramId || !user) {
+            setChannelReady(false);
+            setPresenceParticipants([]);
+            setRemoteCursorsMap({});
+            return;
+        }
+
+        const channel = supabaseClient
+            .channel(`diagram:${diagramId}`, {
+                config: {
+                    presence: {
+                        key: sessionId,
+                    },
+                },
+            })
+            .on('broadcast', { event: DIRTY_EVENT }, (payload) => {
+                const sender = payload.payload?.sessionId;
+                if (!sender || sender === sessionId) {
+                    return;
+                }
+
+                if (payload.payload?.diagramId !== diagramId) {
+                    return;
+                }
+
+                suppressBroadcastRef.current = true;
+                if (loadDiagramRef.current) {
+                    void loadDiagramRef.current(diagramId);
+                }
+            })
+            .on('broadcast', { event: CURSOR_EVENT }, (payload) => {
+                const sender = payload.payload?.sessionId;
+                if (!sender || sender === sessionId) {
+                    return;
+                }
+
+                setRemoteCursorsMap((current) => {
+                    const next = { ...current };
+                    const cursor = payload.payload?.cursor as
+                        | { x: number; y: number }
+                        | null
+                        | undefined;
+                    if (!cursor) {
+                        delete next[sender];
+                    } else {
+                        next[sender] = {
+                            sessionId: sender,
+                            userId: payload.payload?.userId,
+                            x: cursor.x,
+                            y: cursor.y,
+                            updatedAt: Date.now(),
+                        };
+                    }
+                    return next;
+                });
+            });
+
+        const syncPresence = () => {
+            const state =
+                channel.presenceState<
+                    Omit<DiagramPresenceParticipant, 'presenceRef'>
+                >();
+
+            const participants = Object.values(state)
+                .flatMap((entries) => entries)
+                .map((entry, index) => {
+                    const { presence_ref: presenceRef } = entry as Omit<
+                        DiagramPresenceParticipant,
+                        'presenceRef'
+                    > & { presence_ref?: string };
+
+                    return {
+                        ...entry,
+                        presenceRef:
+                            presenceRef ??
+                            `${entry.sessionId}-${String(index)}`,
+                    } satisfies DiagramPresenceParticipant;
+                })
+                .sort((a, b) => {
+                    const aName = a.name ?? '';
+                    const bName = b.name ?? '';
+                    return aName.localeCompare(bName);
+                });
+
+            setPresenceParticipants(participants);
+
+            const activeSessions = new Set(
+                participants.map((participant) => participant.sessionId)
+            );
+            setRemoteCursorsMap((current) => {
+                const next = { ...current };
+                for (const key of Object.keys(next)) {
+                    if (!activeSessions.has(key)) {
+                        delete next[key];
+                    }
+                }
+                return next;
+            });
+        };
+
+        channel
+            .on('presence', { event: 'sync' }, syncPresence)
+            .on('presence', { event: 'join' }, syncPresence)
+            .on('presence', { event: 'leave' }, syncPresence);
+
+        setRealtimeChannel(channel);
+        setChannelReady(false);
+        setPresenceParticipants([]);
+        setRemoteCursorsMap({});
+
+        let keepAliveTimer: ReturnType<typeof setInterval> | null = null;
+        let isActive = true;
+
+        void channel.subscribe(async (status) => {
+            if (!isActive) {
+                return;
+            }
+
+            if (status === 'SUBSCRIBED') {
+                setChannelReady(true);
+                await channel.track({
+                    sessionId,
+                    userId: user.id,
+                    email: user.email ?? undefined,
+                    name:
+                        (user.user_metadata?.full_name as string | undefined) ??
+                        user.email ??
+                        'Anonymous user',
+                    avatarUrl:
+                        (user.user_metadata?.avatar_url as
+                            | string
+                            | undefined) ?? undefined,
+                    lastSeenAt: new Date().toISOString(),
+                });
+
+                syncPresence();
+
+                keepAliveTimer = setInterval(() => {
+                    if (!isActive) {
+                        return;
+                    }
+                    void channel.track({
+                        sessionId,
+                        userId: user.id,
+                        email: user.email ?? undefined,
+                        name:
+                            (user.user_metadata?.full_name as
+                                | string
+                                | undefined) ??
+                            user.email ??
+                            'Anonymous user',
+                        avatarUrl:
+                            (user.user_metadata?.avatar_url as
+                                | string
+                                | undefined) ?? undefined,
+                        lastSeenAt: new Date().toISOString(),
+                    });
+                }, PRESENCE_KEEP_ALIVE_MS);
+
+                if (!cursorGcIntervalRef.current) {
+                    cursorGcIntervalRef.current = setInterval(() => {
+                        if (!isActive) {
+                            return;
+                        }
+                        setRemoteCursorsMap((current) => {
+                            const now = Date.now();
+                            const next = { ...current };
+                            for (const key of Object.keys(next)) {
+                                if (
+                                    now - next[key]!.updatedAt >
+                                    CURSOR_STALE_THRESHOLD_MS
+                                ) {
+                                    delete next[key];
+                                }
+                            }
+                            return next;
+                        });
+                    }, CURSOR_STALE_THRESHOLD_MS);
+                }
+            }
+        });
+
+        return () => {
+            if (keepAliveTimer) {
+                clearInterval(keepAliveTimer);
+            }
+            if (cursorGcIntervalRef.current) {
+                clearInterval(cursorGcIntervalRef.current);
+                cursorGcIntervalRef.current = null;
+            }
+            isActive = false;
+            setChannelReady(false);
+            setPresenceParticipants([]);
+            setRemoteCursorsMap({});
+            setRealtimeChannel((current) =>
+                current === channel ? null : current
+            );
+            void channel.unsubscribe();
+        };
+    }, [diagramId, sessionId, supabaseEnabled, user]);
 
     const clearDiagramData: ChartDBContext['clearDiagramData'] =
         useCallback(async () => {
@@ -1607,6 +1863,104 @@ export const ChartDBProvider: React.FC<
         [storageDB, loadDiagramFromData]
     );
 
+    useEffect(() => {
+        loadDiagramRef.current = loadDiagram;
+    }, [loadDiagram]);
+
+    useEffect(() => {
+        if (
+            !supabaseEnabled ||
+            !channelReady ||
+            !realtimeChannel ||
+            !diagramId
+        ) {
+            return;
+        }
+
+        if (initialLoadRef.current) {
+            initialLoadRef.current = false;
+            return;
+        }
+
+        if (suppressBroadcastRef.current) {
+            suppressBroadcastRef.current = false;
+            return;
+        }
+
+        void realtimeChannel.send({
+            type: 'broadcast',
+            event: DIRTY_EVENT,
+            payload: {
+                sessionId,
+                diagramId,
+                updatedAt: diagramUpdatedAt.toISOString(),
+            },
+        });
+    }, [
+        channelReady,
+        diagramId,
+        diagramUpdatedAt,
+        realtimeChannel,
+        sessionId,
+        supabaseEnabled,
+    ]);
+
+    const sendCursorUpdate = useCallback(
+        (cursor: { x: number; y: number } | null) => {
+            if (
+                !supabaseEnabled ||
+                !channelReady ||
+                !realtimeChannel ||
+                !diagramId
+            ) {
+                return;
+            }
+
+            void realtimeChannel.send({
+                type: 'broadcast',
+                event: CURSOR_EVENT,
+                payload: {
+                    sessionId,
+                    diagramId,
+                    userId: user?.id ?? null,
+                    cursor,
+                },
+            });
+        },
+        [
+            channelReady,
+            diagramId,
+            realtimeChannel,
+            sessionId,
+            supabaseEnabled,
+            user?.id,
+        ]
+    );
+
+    const remoteCursors = useMemo(
+        () => Object.values(remoteCursorsMap),
+        [remoteCursorsMap]
+    );
+
+    const realtimeContextValue = useMemo(
+        () => ({
+            channel: channelReady ? realtimeChannel : null,
+            channelReady,
+            sessionId,
+            participants: presenceParticipants,
+            remoteCursors,
+            sendCursorUpdate,
+        }),
+        [
+            channelReady,
+            presenceParticipants,
+            realtimeChannel,
+            remoteCursors,
+            sendCursorUpdate,
+            sessionId,
+        ]
+    );
+
     // Custom type operations
     const getCustomType: ChartDBContext['getCustomType'] = useCallback(
         (id: string) => customTypes.find((type) => type.id === id) ?? null,
@@ -1752,81 +2106,83 @@ export const ChartDBProvider: React.FC<
     );
 
     return (
-        <chartDBContext.Provider
-            value={{
-                diagramId,
-                diagramName,
-                databaseType,
-                tables,
-                relationships,
-                dependencies,
-                areas,
-                currentDiagram,
-                schemas,
-                events,
-                readonly,
-                updateDiagramData,
-                updateDiagramId,
-                updateDiagramName,
-                loadDiagram,
-                loadDiagramFromData,
-                updateDatabaseType,
-                updateDatabaseEdition,
-                clearDiagramData,
-                deleteDiagram,
-                updateDiagramUpdatedAt,
-                createTable,
-                addTable,
-                addTables,
-                getTable,
-                removeTable,
-                removeTables,
-                updateTable,
-                updateTablesState,
-                updateField,
-                removeField,
-                createField,
-                addField,
-                addIndex,
-                createIndex,
-                removeIndex,
-                getField,
-                getIndex,
-                updateIndex,
-                addRelationship,
-                addRelationships,
-                createRelationship,
-                getRelationship,
-                removeRelationship,
-                removeRelationships,
-                updateRelationship,
-                addDependency,
-                addDependencies,
-                createDependency,
-                getDependency,
-                removeDependency,
-                removeDependencies,
-                updateDependency,
-                createArea,
-                addArea,
-                addAreas,
-                getArea,
-                removeArea,
-                removeAreas,
-                updateArea,
-                customTypes,
-                createCustomType,
-                addCustomType,
-                addCustomTypes,
-                getCustomType,
-                removeCustomType,
-                removeCustomTypes,
-                updateCustomType,
-                highlightCustomTypeId,
-                highlightedCustomType,
-            }}
-        >
-            {children}
-        </chartDBContext.Provider>
+        <diagramRealtimeContext.Provider value={realtimeContextValue}>
+            <chartDBContext.Provider
+                value={{
+                    diagramId,
+                    diagramName,
+                    databaseType,
+                    tables,
+                    relationships,
+                    dependencies,
+                    areas,
+                    currentDiagram,
+                    schemas,
+                    events,
+                    readonly,
+                    updateDiagramData,
+                    updateDiagramId,
+                    updateDiagramName,
+                    loadDiagram,
+                    loadDiagramFromData,
+                    updateDatabaseType,
+                    updateDatabaseEdition,
+                    clearDiagramData,
+                    deleteDiagram,
+                    updateDiagramUpdatedAt,
+                    createTable,
+                    addTable,
+                    addTables,
+                    getTable,
+                    removeTable,
+                    removeTables,
+                    updateTable,
+                    updateTablesState,
+                    updateField,
+                    removeField,
+                    createField,
+                    addField,
+                    addIndex,
+                    createIndex,
+                    removeIndex,
+                    getField,
+                    getIndex,
+                    updateIndex,
+                    addRelationship,
+                    addRelationships,
+                    createRelationship,
+                    getRelationship,
+                    removeRelationship,
+                    removeRelationships,
+                    updateRelationship,
+                    addDependency,
+                    addDependencies,
+                    createDependency,
+                    getDependency,
+                    removeDependency,
+                    removeDependencies,
+                    updateDependency,
+                    createArea,
+                    addArea,
+                    addAreas,
+                    getArea,
+                    removeArea,
+                    removeAreas,
+                    updateArea,
+                    customTypes,
+                    createCustomType,
+                    addCustomType,
+                    addCustomTypes,
+                    getCustomType,
+                    removeCustomType,
+                    removeCustomTypes,
+                    updateCustomType,
+                    highlightCustomTypeId,
+                    highlightedCustomType,
+                }}
+            >
+                {children}
+            </chartDBContext.Provider>
+        </diagramRealtimeContext.Provider>
     );
 };

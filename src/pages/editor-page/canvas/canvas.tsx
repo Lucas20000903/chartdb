@@ -93,6 +93,8 @@ import { filterTable } from '@/lib/domain/diagram-filter/filter';
 import { defaultSchemas } from '@/lib/data/default-schemas';
 import { useDiff } from '@/context/diff-context/use-diff';
 import { useClickAway } from 'react-use';
+import { useDiagramRealtime } from '@/context/diagram-realtime-context/use-diagram-realtime';
+import { CollaboratorCursors } from './collaborator-cursors';
 
 const HIGHLIGHTED_EDGE_Z_INDEX = 1;
 const DEFAULT_EDGE_Z_INDEX = 0;
@@ -1219,6 +1221,71 @@ export const Canvas: React.FC<CanvasProps> = ({ initialTables }) => {
     }, []);
 
     const containerRef = useRef<HTMLDivElement>(null);
+    const { sendCursorUpdate } = useDiagramRealtime();
+    const cursorUpdateRef = useRef(sendCursorUpdate);
+
+    useEffect(() => {
+        cursorUpdateRef.current = sendCursorUpdate;
+    }, [sendCursorUpdate]);
+
+    useEffect(() => {
+        const element = containerRef.current;
+        if (!element || !cursorUpdateRef.current) {
+            return;
+        }
+
+        let animationFrame: number | null = null;
+
+        const emitCursor = (event: PointerEvent) => {
+            if (!cursorUpdateRef.current) {
+                return;
+            }
+            const rect = element.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) {
+                return;
+            }
+
+            const x = Math.min(
+                Math.max((event.clientX - rect.left) / rect.width, 0),
+                1
+            );
+            const y = Math.min(
+                Math.max((event.clientY - rect.top) / rect.height, 0),
+                1
+            );
+
+            cursorUpdateRef.current({ x, y });
+        };
+
+        const handlePointerMove = (event: PointerEvent) => {
+            if (animationFrame) {
+                cancelAnimationFrame(animationFrame);
+            }
+            animationFrame = requestAnimationFrame(() => emitCursor(event));
+        };
+
+        const handlePointerLeave = () => {
+            if (cursorUpdateRef.current) {
+                cursorUpdateRef.current(null);
+            }
+        };
+
+        element.addEventListener('pointermove', handlePointerMove);
+        element.addEventListener('pointerdown', emitCursor);
+        element.addEventListener('pointerleave', handlePointerLeave);
+
+        return () => {
+            element.removeEventListener('pointermove', handlePointerMove);
+            element.removeEventListener('pointerdown', emitCursor);
+            element.removeEventListener('pointerleave', handlePointerLeave);
+            if (animationFrame) {
+                cancelAnimationFrame(animationFrame);
+            }
+            if (cursorUpdateRef.current) {
+                cursorUpdateRef.current(null);
+            }
+        };
+    }, []);
     const exitEditTableMode = useCallback(
         () => setEditTableModeTable(null),
         [setEditTableModeTable]
@@ -1454,6 +1521,7 @@ export const Canvas: React.FC<CanvasProps> = ({ initialTables }) => {
                         <CanvasFilter onClose={() => setShowFilter(false)} />
                     ) : null}
                 </ReactFlow>
+                <CollaboratorCursors containerRef={containerRef} />
                 <MarkerDefinitions />
             </div>
         </CanvasContextMenu>
