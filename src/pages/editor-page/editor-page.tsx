@@ -26,6 +26,8 @@ import { useDiagramLoader } from './use-diagram-loader';
 import { DiffProvider } from '@/context/diff-context/diff-provider';
 import { TopNavbarMock } from './top-navbar/top-navbar-mock';
 import { DiagramFilterProvider } from '@/context/diagram-filter-context/diagram-filter-provider';
+import { useAuth } from '@/hooks/use-auth';
+import { EmailAuthForm } from '@/components/auth/email-auth-form';
 
 const OPEN_STAR_US_AFTER_SECONDS = 30;
 const SHOW_STAR_US_AGAIN_AFTER_DAYS = 1;
@@ -45,6 +47,7 @@ const EditorPageComponent: React.FC = () => {
     const { starUsDialogLastOpen, setStarUsDialogLastOpen, githubRepoOpened } =
         useLocalConfig();
     const { initialDiagram } = useDiagramLoader();
+    const { user, loading: authLoading, supabaseEnabled } = useAuth();
 
     useEffect(() => {
         if (HIDE_CHARTDB_CLOUD) {
@@ -70,6 +73,34 @@ const EditorPageComponent: React.FC = () => {
         setStarUsDialogLastOpen,
         starUsDialogLastOpen,
     ]);
+
+    if (supabaseEnabled && authLoading) {
+        return (
+            <>
+                <Helmet>
+                    <title>ChartDB - Loading</title>
+                </Helmet>
+                <section className="flex h-screen w-screen items-center justify-center bg-background">
+                    <Spinner size={isDesktop ? 'large' : 'medium'} />
+                </section>
+                <Toaster />
+            </>
+        );
+    }
+
+    if (supabaseEnabled && !authLoading && !user) {
+        return (
+            <>
+                <Helmet>
+                    <title>ChartDB - Sign in</title>
+                </Helmet>
+                <section className="flex h-screen w-screen items-center justify-center bg-gradient-to-br from-background via-background to-muted">
+                    <EmailAuthForm />
+                </section>
+                <Toaster />
+            </>
+        );
+    }
 
     return (
         <>

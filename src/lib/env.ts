@@ -12,3 +12,20 @@ export const HIDE_CHARTDB_CLOUD: boolean =
 export const DISABLE_ANALYTICS: boolean =
     (window?.env?.DISABLE_ANALYTICS ??
         import.meta.env.VITE_DISABLE_ANALYTICS) === 'true';
+
+const resolveEnvValue = (key: string): string => {
+    const windowValue = window?.env?.[key];
+
+    if (typeof windowValue === 'string') {
+        return windowValue;
+    }
+
+    const importMetaKey = `VITE_${key}` as keyof ImportMetaEnv;
+    const importMetaValue = import.meta.env[importMetaKey];
+
+    return typeof importMetaValue === 'string' ? importMetaValue : '';
+};
+
+export const SUPABASE_URL: string = resolveEnvValue('SUPABASE_URL');
+export const SUPABASE_ANON_KEY: string = resolveEnvValue('SUPABASE_ANON_KEY');
+export const SUPABASE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);

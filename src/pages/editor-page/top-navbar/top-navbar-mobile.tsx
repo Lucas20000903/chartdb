@@ -6,6 +6,8 @@ import { Menu } from './menu/menu';
 import { Button } from '@/components/button/button';
 import { useSidebar } from '@/components/sidebar/use-sidebar';
 import { MenuIcon } from 'lucide-react';
+import { UserMenu } from './user-menu';
+import { CollaboratorPresence } from './collaborator-presence';
 
 export interface TopNavbarMobileProps {}
 
@@ -49,8 +51,10 @@ export const TopNavbarMobile: React.FC<TopNavbarMobileProps> = () => {
                     </div>
 
                     <div className="flex items-center gap-2">
+                        <CollaboratorPresence />
                         {renderStars()}
                         <LanguageNav />
+                        <UserMenu />
                     </div>
                 </div>
                 <Menu />
